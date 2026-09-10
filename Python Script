@@ -1,0 +1,487 @@
+# generate_idf_dataset.py
+# Generates a synthetic dataset modeled for iD-like fresh foods in UAE (7 emirates).
+# Produces CSV files in current directory. Default: medium dataset (~10k sales rows).
+# Requirements: Python 3.8+, pandas, numpy
+#
+# Usage:
+#   pip install pandas numpy
+#   python generate_idf_dataset.py
+#
+# The script is deterministic (seeded) and configurable via top-level parameters.
+
+import csv
+import json
+import random
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# Config
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+TODAY = datetime.utcnow().date()
+# 12-month window: last 365 days
+END_DATE = TODAY
+START_DATE = END_DATE - timedelta(days=365)
+
+NUM_SALES = 10000  # medium
+NUM_CUSTOMERS = 800
+NUM_RETAILERS = 250
+NUM_PRODUCTS = 12
+
+EMIRATES = [
+    "Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"
+]
+
+CURRENCY = "AED"
+
+# Emirate weights (default): Dubai dominant
+EMIRATE_WEIGHTS = np.array([0.25, 0.45, 0.12, 0.06, 0.03, 0.06, 0.03])
+EMIRATE_WEIGHTS = EMIRATE_WEIGHTS / EMIRATE_WEIGHTS.sum()
+
+CHANNELS = ["retail", "supermarket", "online"]
+CUSTOMER_SEGMENTS = ["SouthAsian", "Emirati", "Expat"]
+CUSTOMER_TYPES = ["retailer", "consumer", "wholesaler"]
+
+PRODUCT_CATEGORIES = [
+    "Parotas", "Chapatis", "Batter", "Idli/Dosa Batter", "Frozen Chapatis"
+]
+
+# Festival/promo windows (synthetic; adjust dates if needed)
+PROMO_WINDOWS = [
+    {"name": "Ramadan Promo", "start": END_DATE - timedelta(days=270), "end": END_DATE - timedelta(days=240), "festive": "Ramadan"},
+    {"name": "Eid Promo", "start": END_DATE - timedelta(days=240), "end": END_DATE - timedelta(days=230), "festive": "Eid"},
+    {"name": "Diwali Promo", "start": END_DATE - timedelta(days=150), "end": END_DATE - timedelta(days=145), "festive": "Diwali"},
+    {"name": "Summer Sale", "start": END_DATE - timedelta(days=60), "end": END_DATE - timedelta(days=50), "festive": "Summer"}
+]
+
+# Secondary market estimates (synthetic annotated estimates)
+MARKET_ESTIMATES = [
+    {"metric": "GCC frozen food market CAGR (2021-2026)", "value": "5.5%", "source_note": "Approx. estimate based on public reports (IMARC/Statista aggregated). Use official numbers if available."},
+    {"metric": "UAE frozen food market size 2025 (approx., AED mn)", "value": "2,100", "source_note": "Synthetic estimate for scenario modelling."},
+    {"metric": "E-commerce share of refrigerated/frozen groceries (UAE 2025)", "value": "12%", "source_note": "Estimated proxy; use local market reports for exact values."}
+]
+
+OUTPUT_DIR = Path("./idf_dataset_output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def daterange(start_date, end_date):
+    for n in range(int((end_date - start_date).days) + 1):
+        yield start_date + timedelta(n)
+
+# 1) Products
+def make_products():
+    products = []
+    # Build a small catalog across requested categories
+    sku_idx = 1
+    prototypes = [
+        ("Idli/Dosa Batter - 1kg", "Batter", 1000, 7, True, 6.0, 8.5),
+        ("Dosa Batter - 1kg", "Batter", 1000, 7, True, 5.8, 8.0),
+        ("Parota - 250g (2pcs)", "Parotas", 250, 5, True, 1.2, 2.0),
+        ("Chapati - 400g (6pcs)", "Chapatis", 400, 30, True, 2.0, 3.50),
+        ("Frozen Chapati - 400g (10pcs)", "Frozen Chapatis", 400, 180, True, 2.5, 4.0),
+        ("Parota Stuffed - 300g", "Parotas", 300, 7, True, 1.5, 2.8),
+        ("Plain Chapati - 250g (4pcs)", "Chapatis", 250, 30, True, 1.1, 1.9),
+        ("Paneer Fresh - 200g", "Dairy", 200, 5, True, 3.5, 5.5),
+    ]
+    # Expand prototypes to reach NUM_PRODUCTS
+    while len(products) < NUM_PRODUCTS:
+        proto = prototypes[len(products) % len(prototypes)]
+        pid = f"PROD-{sku_idx:03d}"
+        name, category, pack_size_g, shelf_life_days, halal, unit_cost, list_price = proto
+        # small randomization
+        list_price = round(list_price * (1 + np.random.normal(0, 0.03)), 2)
+        unit_cost = round(unit_cost * (1 + np.random.normal(0, 0.04)), 2)
+        products.append({
+            "product_id": pid,
+            "sku": pid.replace("PROD", "SKU"),
+            "name": name,
+            "category": category,
+            "pack_size_g": int(pack_size_g),
+            "shelf_life_days": int(shelf_life_days),
+            "halal_certified": halal,
+            "unit_cost_aed": unit_cost,
+            "list_price_aed": list_price,
+            "cold_chain_required": category in ["Frozen Chapatis", "Dairy"]
+        })
+        sku_idx += 1
+    return pd.DataFrame(products)
+
+# 2) Stores / store_channels
+def make_stores():
+    stores = []
+    # Create some supermarkets, retail stores, and web channels
+    store_idx = 1
+    for emirate in EMIRATES:
+        # create 10 stores per emirate roughly (some will be online entries)
+        num = 10
+        for i in range(num):
+            cid = f"STORE-{store_idx:04d}"
+            channel_type = random.choices(CHANNELS, weights=[0.5, 0.3, 0.2])[0]
+            name = f"{channel_type.title()} {emirate[:3].upper()} {i+1}"
+            stores.append({
+                "store_or_website_id": cid,
+                "name": name,
+                "channel_type": channel_type,
+                "city": name.split()[-2] if len(name.split())>1 else emirate,
+                "emirate": emirate
+            })
+            store_idx += 1
+    # Add one canonical web channel per emirate
+    for emirate in EMIRATES:
+        stores.append({
+            "store_or_website_id": f"WEB-{emirate[:3].upper()}",
+            "name": f"Web-{emirate}",
+            "channel_type": "online",
+            "city": emirate,
+            "emirate": emirate
+        })
+    return pd.DataFrame(stores)
+
+# 3) Customers
+def make_customers(stores_df):
+    customers = []
+    for i in range(NUM_CUSTOMERS):
+        cid = f"CUST-{i+1:05d}"
+        ctype = random.choices(CUSTOMER_TYPES, weights=[0.4, 0.45, 0.15])[0]
+        emirate = random.choices(EMIRATES, weights=EMIRATE_WEIGHTS)[0]
+        segment = random.choices(CUSTOMER_SEGMENTS, weights=[0.6, 0.15, 0.25])[0]
+        name = f"{'Shop' if ctype=='retailer' else ('Household' if ctype=='consumer' else 'Wholesaler')} {cid[-4:]}"
+        tier = random.choice(["Bronze", "Silver", "Gold", "Platinum"]) if ctype != "consumer" else "NA"
+        customers.append({
+            "customer_id": cid,
+            "name": name,
+            "customer_type": ctype,
+            "segment": segment,
+            "city": emirate,
+            "emirate": emirate,
+            "account_tier": tier,
+            "preferred_store_id": stores_df[stores_df.emirate == emirate].sample(1).iloc[0]["store_or_website_id"]
+        })
+    return pd.DataFrame(customers)
+
+# 4) Promotions
+def make_promotions():
+    promos = []
+    pid = 1
+    for w in PROMO_WINDOWS:
+        # create a couple promos per window
+        for i in range(2):
+            prom_id = f"PROMO-{pid:03d}"
+            start = w["start"] + timedelta(days=np.random.randint(0, 3))
+            end = min(w["end"], start + timedelta(days=np.random.randint(3, 12)))
+            channels = random.sample(CHANNELS, k=random.randint(1, len(CHANNELS)))
+            discount = random.choice([5, 8, 10, 12, 15])
+            promos.append({
+                "promotion_id": prom_id,
+                "name": f"{w['name']} - {i+1}",
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "channels": "|".join(channels),
+                "promo_type": "discount",
+                "discount_pct": discount,
+                "festive_flag": w["festive"]
+            })
+            pid += 1
+    # A few rolling promos (non-festive)
+    for i in range(3):
+        prom_id = f"PROMO-{pid:03d}"
+        start = START_DATE + timedelta(days=np.random.randint(0, 300))
+        end = start + timedelta(days=random.randint(7, 30))
+        promos.append({
+            "promotion_id": prom_id,
+            "name": f"Rolling Discount {i+1}",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "channels": random.choice(CHANNELS),
+            "promo_type": "discount",
+            "discount_pct": random.choice([3, 5, 7]),
+            "festive_flag": ""
+        })
+        pid += 1
+    return pd.DataFrame(promos)
+
+# 5) Inventory batches
+def make_batches(products_df):
+    batches = []
+    batch_id = 1
+    for _, p in products_df.iterrows():
+        # produce multiple batches across the 12 months
+        num_batches = random.randint(8, 20)
+        for i in range(num_batches):
+            prod_date = START_DATE + timedelta(days=random.randint(0, 365))
+            shelf = int(p["shelf_life_days"])
+            expiry = prod_date + timedelta(days=max(1, shelf))
+            qty = int(2000 * (1 + np.random.rand()))
+            location = random.choice([f"Warehouse-{p['product_id'][:6]}", f"Coldroom-{random.choice(EMIRATES) if p['cold_chain_required'] else random.choice(EMIRATES)}"])
+            batches.append({
+                "batch_id": f"BATCH-{batch_id:06d}",
+                "product_id": p["product_id"],
+                "production_date": prod_date.isoformat(),
+                "expiry_date": expiry.isoformat(),
+                "quantity_produced": qty,
+                "location": location,
+                "cold_chain_required": bool(p["cold_chain_required"]),
+                "qc_status": random.choices(["PASS", "HOLD", "REJECT"], weights=[0.9, 0.08, 0.02])[0]
+            })
+            batch_id += 1
+    return pd.DataFrame(batches)
+
+# 6) Sales transactions (core)
+def make_sales(products_df, customers_df, stores_df, promos_df):
+    # Precompute product popularity weights (some products sell more)
+    cat_pop = {"Batter": 0.25, "Idli/Dosa Batter": 0.2, "Parotas": 0.18, "Chapatis": 0.2, "Frozen Chapatis": 0.17, "Dairy": 0.0}
+    prod_weights = []
+    for _, p in products_df.iterrows():
+        base = cat_pop.get(p["category"], 0.05)
+        # product-specific popularity fudge
+        prod_weights.append(base * (1 + np.random.normal(0, 0.15)))
+    prod_weights = np.array(prod_weights)
+    prod_weights = np.clip(prod_weights, 0.01, None)
+    prod_weights = prod_weights / prod_weights.sum()
+
+    sale_rows = []
+    sale_id = 1
+
+    # Pre-construct date list and weekday weights + festival lift factors
+    dates = list(daterange(START_DATE, END_DATE))
+    weekday_weights = np.array([0.9 if d.weekday() < 5 else 1.15 for d in dates])  # higher on weekends
+    date_weight = weekday_weights / weekday_weights.sum()
+
+    # Build mapping of date->promotion multipliers for products
+    promo_map = {}
+    for _, promo in promos_df.iterrows():
+        start = datetime.fromisoformat(promo["start_date"]).date()
+        end = datetime.fromisoformat(promo["end_date"]).date()
+        for d in daterange(start, end):
+            promo_map.setdefault(d, []).append(promo.to_dict())
+
+    for _ in range(NUM_SALES):
+        sale_date = random.choices(dates, weights=date_weight, k=1)[0]
+        product = products_df.sample(weights=prod_weights, n=1).iloc[0]
+        customer = customers_df.sample(n=1).iloc[0]
+        # channel selection: align with customer preference and store chosen
+        store_pool = stores_df[stores_df.emirate == customer["emirate"]]
+        store = store_pool.sample(1).iloc[0]
+        channel = store["channel_type"]
+        # quantity distribution
+        if customer["customer_type"] == "retailer":
+            units = int(round(max(1, np.random.poisson(20))))
+        elif customer["customer_type"] == "wholesaler":
+            units = int(round(max(5, np.random.poisson(100))))
+        else:
+            units = int(round(max(1, np.random.poisson(2))))
+        # base price
+        list_price = float(product["list_price_aed"])
+        # Check active promotions
+        active_promos = promo_map.get(sale_date, [])
+        selected_promo = None
+        discount_pct = 0
+        if active_promos:
+            # some chance the product participates
+            if random.random() < 0.35:
+                selected_promo = random.choice(active_promos)
+                # ensure channel match
+                if channel in selected_promo["channels"].split("|"):
+                    discount_pct = selected_promo["discount_pct"]
+        # price after discount
+        unit_price = round(list_price * (1 - discount_pct / 100.0), 2)
+        total_amount = round(unit_price * units, 2)
+        payment_type = random.choices(["card", "cash", "bank_transfer"], weights=[0.6, 0.35, 0.05])[0]
+        sale_rows.append({
+            "sale_id": f"S{sale_id:07d}",
+            "sale_date": sale_date.isoformat(),
+            "product_id": product["product_id"],
+            "customer_id": customer["customer_id"],
+            "channel": channel,
+            "units": units,
+            "unit_price_aed": unit_price,
+            "promotion_id": selected_promo["promotion_id"] if selected_promo else "",
+            "discount_pct": discount_pct,
+            "total_amount_aed": total_amount,
+            "payment_type": payment_type,
+            "store_or_website_id": store["store_or_website_id"],
+            "emirate": customer["emirate"]
+        })
+        sale_id += 1
+
+    return pd.DataFrame(sale_rows)
+
+# 7) Shipments (derived from sales)
+def make_shipments(sales_df):
+    shipments = []
+    ship_id = 1
+    for _, s in sales_df.iterrows():
+        ship_date = datetime.fromisoformat(s["sale_date"]).date()
+        # expected lead time: retail local same-day-1, online 1-4 days, wholesale 1-5
+        if s["channel"] == "online":
+            lead = max(1, int(np.random.poisson(2)))
+        elif s["channel"] == "wholesale":
+            lead = max(1, int(np.random.poisson(3)))
+        else:
+            lead = 0 if random.random() < 0.5 else 1
+        expected_delivery = ship_date + timedelta(days=lead if lead>0 else 0)
+        # actual delivery sometimes delayed
+        delay = int(np.random.choice([0, 0, 0, 1, 2], p=[0.6, 0.2, 0.1, 0.06, 0.04]))
+        actual_delivery = expected_delivery + timedelta(days=delay) if expected_delivery else ""
+        cold_chain = False  # link to product later if needed
+        shipments.append({
+            "shipment_id": f"SHIP-{ship_id:07d}",
+            "sale_id": s["sale_id"],
+            "ship_date": ship_date.isoformat(),
+            "expected_delivery_date": expected_delivery.isoformat() if expected_delivery else "",
+            "actual_delivery_date": actual_delivery.isoformat() if actual_delivery else "",
+            "carrier": random.choice(["QuickShip UAE", "LogiTrans", "FastCourier", "LocalExpress"]),
+            "cold_chain": cold_chain,
+            "qty_shipped": int(s["units"]),
+            "status": "Delivered" if actual_delivery and actual_delivery <= END_DATE else ("In Transit" if actual_delivery else "Pending")
+        })
+        ship_id += 1
+    return pd.DataFrame(shipments)
+
+# 8) Returns
+def make_returns(sales_df, products_df):
+    returns = []
+    ret_id = 1
+    # small percent returned
+    mask = np.random.rand(len(sales_df)) < 0.012  # 1.2% returns
+    for _, s in sales_df[mask].iterrows():
+        qty_returned = max(1, int(round(s["units"] * np.random.uniform(0.1, 0.5))))
+        reasons = random.choice(["Damaged packaging", "Quality issue", "Customer changed mind", "Expired"])
+        resolution = random.choice(["Refunded", "Replaced", "Store credit"])
+        returns.append({
+            "return_id": f"RET-{ret_id:06d}",
+            "sale_id": s["sale_id"],
+            "return_date": (datetime.fromisoformat(s["sale_date"]).date() + timedelta(days=random.randint(1, 7))).isoformat(),
+            "product_id": s["product_id"],
+            "qty_returned": qty_returned,
+            "reason": reasons,
+            "resolution": resolution
+        })
+        ret_id += 1
+    return pd.DataFrame(returns)
+
+# 9) Inventory levels (periodic snapshots / events)
+def make_inventory_levels(batches_df, products_df):
+    # create a weekly snapshot per location for last 52 weeks per product-location
+    events = []
+    event_id = 1
+    locations = batches_df["location"].unique().tolist()
+    for loc in locations:
+        for _, p in products_df.iterrows():
+            # weekly over last 52 weeks
+            for w in range(52):
+                ts = END_DATE - timedelta(days=w*7)
+                qty = max(0, int(2000 * (0.5 + np.random.rand())))
+                # occasional stockout
+                event_type = "snapshot"
+                if random.random() < 0.02:
+                    event_type = "stockout"
+                    qty = 0
+                events.append({
+                    "inventory_event_id": f"IE-{event_id:08d}",
+                    "timestamp": ts.isoformat(),
+                    "location": loc,
+                    "product_id": p["product_id"],
+                    "batch_id": "",
+                    "qty_on_hand": qty,
+                    "event_type": event_type,
+                    "lead_time_days": round(max(0.5, np.random.normal(2, 1)), 1)
+                })
+                event_id += 1
+    return pd.DataFrame(events)
+
+# 10) Logistics metrics (daily aggregated per emirate)
+def make_logistics_metrics(sales_df):
+    metrics = []
+    dates = sorted(set(sales_df["sale_date"]))
+    for d in dates:
+        date = d
+        for emirate in EMIRATES:
+            mask = (sales_df["sale_date"] == date) & (sales_df["emirate"] == emirate)
+            stockouts_count = int(np.random.poisson(0.02 * mask.sum()))
+            avg_lead_time = round(max(0.5, np.random.normal(1.8, 0.6)), 2)
+            cold_chain_uptime = round(max(80.0, 98.0 + np.random.normal(0, 1.0)), 2)
+            metrics.append({
+                "date": date,
+                "location": emirate,
+                "stockouts_count": stockouts_count,
+                "avg_lead_time_days": avg_lead_time,
+                "cold_chain_uptime_pct": cold_chain_uptime
+            })
+    return pd.DataFrame(metrics)
+
+# Save helpers
+def save_df(df, name):
+    path = OUTPUT_DIR / name
+    df.to_csv(path, index=False)
+    print(f"Wrote {path} ({len(df)} rows)")
+
+def main():
+    print("Generating products...")
+    products_df = make_products()
+    save_df(products_df, "products.csv")
+
+    print("Generating stores...")
+    stores_df = make_stores()
+    save_df(stores_df, "store_channels.csv")
+
+    print("Generating customers...")
+    customers_df = make_customers(stores_df)
+    save_df(customers_df, "customers.csv")
+
+    print("Generating promotions...")
+    promos_df = make_promotions()
+    save_df(promos_df, "promotions.csv")
+
+    print("Generating inventory batches...")
+    batches_df = make_batches(products_df)
+    save_df(batches_df, "inventory_batches.csv")
+
+    print("Generating sales...")
+    sales_df = make_sales(products_df, customers_df, stores_df, promos_df)
+    save_df(sales_df, "sales_transactions.csv")
+
+    print("Generating shipments...")
+    shipments_df = make_shipments(sales_df)
+    save_df(shipments_df, "shipments.csv")
+
+    print("Generating returns...")
+    returns_df = make_returns(sales_df, products_df)
+    save_df(returns_df, "returns.csv")
+
+    print("Generating inventory levels...")
+    inventory_levels_df = make_inventory_levels(batches_df, products_df)
+    save_df(inventory_levels_df, "inventory_levels.csv")
+
+    print("Generating logistics metrics...")
+    logistics_df = make_logistics_metrics(sales_df)
+    save_df(logistics_df, "logistics_metrics.csv")
+
+    print("Generating market metrics...")
+    market_df = pd.DataFrame(MARKET_ESTIMATES)
+    save_df(market_df, "market_metrics.csv")
+
+    # README
+    readme = OUTPUT_DIR / "README_generated.md"
+    with readme.open("w", encoding="utf8") as f:
+        f.write("# Synthetic iD-like Fresh Foods Dataset (Generated)\n\n")
+        f.write(f"Generated: {datetime.utcnow().isoformat()} (seed={SEED})\n\n")
+        f.write("Files:\n\n")
+        for fn in ["products.csv","customers.csv","store_channels.csv","promotions.csv","sales_transactions.csv",
+                   "inventory_batches.csv","inventory_levels.csv","shipments.csv","returns.csv","logistics_metrics.csv","market_metrics.csv"]:
+            f.write(f"- {fn}\n")
+        f.write("\nNotes:\n- Data is synthetic and intended for analysis, demos, model testing.\n- market_metrics.csv contains annotated synthetic estimates designed to be replaced with actual secondary-market figures if you have them.\n- Adjust parameters in generate_idf_dataset.py to change time window, sales volume, festival windows, or price distributions.\n")
+    print(f"Wrote README to {readme}")
+
+if __name__ == "__main__":
+    main()
+# zip the folder and download
+!zip -r idf_dataset_output.zip idf_dataset_output
+
+from google.colab import files
+files.download('idf_dataset_output.zip')   # prompts browser download
